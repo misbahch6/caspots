@@ -2,20 +2,31 @@
 from __future__ import print_function
 
 import math
+from math import log
 import os
 from subprocess import *
 import sys
 import tempfile
 import time
+import random
 
-import gringo
-
-from caspo.core import LogicalNetwork
+#import gringo
+import clingo
+#from caspo.core import LogicalNetwork
 
 from caspots.config import *
 from caspots import asputils
 from caspots.utils import *
-
+from .console import *
+#from caspo.core import Graph, HyperGraph, LogicalNetwork, LogicalNetworkList
+from .graph import Graph
+from .hypergraph import HyperGraph
+from .logicalnetwork import LogicalNetwork, LogicalNetworkList
+from .networks import *
+import crossvar
+from xor_counting import Propagator
+from crossvar import globalvariables
+from pprint import pprint
 def crunch_data(answer, predicate, factor):
     factor = float(factor)
     data = {
@@ -24,9 +35,9 @@ def crunch_data(answer, predicate, factor):
     }
     keys = set()
     for a in answer:
-        p = a.name()
+        p = a.name
         if p in ["obs", predicate]:
-            args = a.args()
+            args = a.arguments
             key = tuple(args[:3])
             val = args[3]
             if p == "obs":
@@ -48,25 +59,22 @@ def MSE(cd):
     return math.sqrt(cum/n)
 
 def count_predicate(answer, predicate):
-    return len([a for a in answer if a.name() == predicate])
+    return len([a for a in answer if a.name == predicate])
 
 class ASPSample:
     def __init__(self, opts, model):
         self.opts = opts
-        self.atoms = model.atoms()
-        self.optimization = model.optimization()
+        self.atoms = model.symbols(atoms=True)
+        self.optimization = model.cost
 
     def weight(self):
-        return self.optimization[0]
-
-    def size(self):
-        return self.optimization[1] if len(self.optimization) > 1 else None
+        return self.optimization
 
     def asp_exclusion(self):
         predicates = ["formula", "dnf", "clause"]
         if self.opts.enum_traces:
             predicates += ["guessed"]
-        clauses = [a for a in self.atoms if a.name() in predicates]
+        clauses = [a for a in self.atoms if a.name in predicates]
         if self.opts.family == "all":
             nb_formula = count_predicate(self.atoms, "formula")
             nb_dnf = count_predicate(self.atoms, "dnf")
@@ -86,14 +94,14 @@ class ASPSample:
         return (mse0, mse)
 
     def network(self, hypergraph):
-        tuples = (f.args() for f in self.atoms if f.name() == "dnf")
+        tuples = (f.arguments for f in self.atoms if f.name == "dnf")
         return LogicalNetwork.from_hypertuples(hypergraph, tuples)
 
     def trace(self, dataset):
         # rewrite dataset using guessed predicate
         for a in self.atoms:
-            if a.name() == "guessed":
-                eid, t, node, value = a.args()
+            if a.name == "guessed":
+                eid, t, node, value = a.arguments
                 if node not in dataset.readout:
                     continue
                 if dataset.experiments[eid].obs[t][node] != value:
@@ -101,105 +109,154 @@ class ASPSample:
                     dataset.experiments[eid].obs[t][node] = value
         return dataset
 
-def print_conf(conf, prefix=""):
-    for k in conf.keys():
-        v = getattr(conf, k)
-        if isinstance(v, gringo.ConfigProxy):
-            print_conf(v, "%s%s" % (prefix, k))
-        else:
-            dbg("# conf %s%s = %s" % (prefix, k, v))
 
 class ASPSolver:
-    def __init__(self, termset, opts, domain=None, restrict=None,
-                        fixpoints=False, nodataset=False):
+    def __init__(self, termset, opts, domain=None):
         self.termset = termset
         self.data = termset.to_str()
         self.opts = opts
+	#self.atoms = model.atoms()
         self.debug = opts.debug
-        self.nodataset = nodataset
         if domain is None:
             self.domain = [aspf("guessBN.lp")]
             if opts.fully_controllable:
                 self.domain.append(aspf("guessBN-controllable.lp"))
-            if restrict:
-                self.domain.append(restrict)
         else:
             self.domain = [domain]
-        if fixpoints:
-            self.domain.append(aspf("fixpoints.lp"))
 
     def default_control(self, *args):
-        control = gringo.Control(["--conf=trendy", "--stats",
-                            "--opt-strat=usc"] + list(args))
+        control = clingo.Control([ "--stats", "--opt-strat=usc", #"--no-ufs-check",#, "--sign-def=rnd", "--sign-fix" #random solution
+] + list(args))
+        #"--conf=trendy"
         for f in self.domain:
             control.load(f)
-        if not self.nodataset:
-            control.load(aspf("supportConsistency.lp"))
-            control.load(aspf("normalize.lp"))
+        control.load(aspf("supportConsistency.lp"))
+        control.load(aspf("normalize.lp"))
         control.add("base", [], self.data)
-
-        if self.opts.clingo_parallel_mode:
-            control.conf.solve.parallel_mode = self.opts.clingo_parallel_mode
-
         return control
 
-    def sample(self, control, first, weight=None, minsize=None):
+    def sample(self, first, scripts=[], weight=None):
+        control = self.default_control("--no-ufs-check")
+        if weight:
+            control.load(aspf("tolerance.lp"))
+            control.add("base", [], "#const minWeight=%s. #const maxWeight=%s" %
+                                        (weight,weight))
+
+        control.load(aspf("showMeasured.lp"))
+        if self.opts.family == "subset":
+            control.load(aspf("minimizeSizeOnly.lp"))
         if first:
-            #control.conf.solve.opt_mode = "opt"
-            self.setup_opt(control)
+            control.load(aspf("minimizeWeightOnly.lp"))
+        for f in scripts:
+            control.load(f)
+        control.ground([("base", [])])
 
-            control.ground([("base", [])])
-
-            control.load(aspf("show.lp"))
-            control.ground([("show", [])])
-            control.assign_external(gringo.Fun("tolerance"),False)
-
-        else:
-            if weight:
-                self.setup_weight(control, weight)
-            if minsize:
-                self.setup_card(control, minsize)
-            control.conf.solve.opt_mode = "ignore"
-            control.conf.solve.models = 1
-
-        models = []
-        res = control.solve(None, lambda model: models.append(ASPSample(self.opts, model)))
-        if models:
-            model = models.pop()
-            return model
+        with control.solve(yield_=True) as solutions:
+            for model in solutions:
+                print (model)
+                return ASPSample(self.opts, model)
 
     def solution_samples(self):
-        control = self.default_control()
-        weight = None
-        size = None
-        i = 0
+        i = 1
+        if self.debug:
+            dbg("# model %d" %i)
+        s = self.sample(True)
+        yield s
+
+        weight = s.weight()
+        fd, excludelp = tempfile.mkstemp(".lp")
+        os.close(fd)
+
+        with open(excludelp, "w") as f:
+            f.write("%s\n" % s.asp_exclusion())
+
+        args = [excludelp]
         while True:
-            s = self.sample(control, i == 0, weight=weight, minsize=size)
+            s = self.sample(False, args, weight=weight)
             if s:
                 i += 1
+                if self.debug:
+                    dbg("# model %d" %i)
                 yield s
-                if i == 1:
-                    weight = s.weight()
-                    size = s.size()
-                    dbg("# first sample weight = %s, size = %s" % (weight, size))
-                control.add("excl", [], s.asp_exclusion())
-                control.ground([("excl", [])])
+                with open(excludelp, "a") as f:
+                    f.write("%s\n" % s.asp_exclusion())
             else:
                 print("# Enumeration complete")
                 break
+        #os.unlink(excludelp)
 
-    def setup_opt(self, control):
+    def solutions(self, on_model, on_model_weight=None, limit=0,
+                    force_weight=None):
+
+        control = self.default_control("0")
+
+        do_mincard = self.opts.family == "mincard" \
+            or self.opts.force_size is not None
+        do_subsets = self.opts.family == "subset" \
+            or (self.opts.family =="mincard" and self.opts.mincard_tolerance)
+
         control.load(aspf("minimizeWeightOnly.lp"))
-        if self.do_mincard:
+        if do_mincard:
             control.load(aspf("minimizeSizeOnly.lp"))
 
-    def setup_weight(self, control, weight):
+        control.ground([("base", [])])
+
+        control.load(aspf("show.lp"))
+        control.ground([("show", [])])
+
+
+        #if crossvar.myflag:
+            #mystr = open("constraintssss.lp", 'r').read()
+            #control.add("RC", [], mystr)
+            #control.load(aspf("constraintssss.lp"))
+            #control.ground([("RC", [])]) 
+
+            #print(crossvar.FO)	
+            #print(crossvar.myflag)
+            #print("hello from the other side")
+
+
+        #Flavio-Xor'''
+
+
+        start = time.time()
+
+        if force_weight is None:
+            control.assign_external(clingo.Function("tolerance"),False)
+            dbg("# start initial solving")
+            opt = []
+            res = control.solve(None, lambda model: opt.append(model.cost))
+            print(opt)
+            dbg("# initial solve took %s" % (time.time()-start))
+
+            optimizations = opt.pop()
+            dbg("# optimizations = %s" % optimizations)
+
+            weight = optimizations[0]
+            if do_mincard:
+                minsize = optimizations[1]
+            if weight > 0 and on_model_weight is not None:
+                for sample in self.solution_samples():
+                    on_model_weight(sample)
+                return
+
+            control.assign_external(clingo.Function("tolerance"),True)
+        else:
+            weight = force_weight
+            dbg("# force weight = %d" % weight)
+
         max_weight = weight + self.opts.weight_tolerance
+        print("weight %s",weight)
         control.add("minWeight", [], ":- not " + str(weight) + " #sum {Erg,E,T,S : measured(E,T,S,V), not guessed(E,T,S,V), toGuess(E,T,S), obs(E,T,S,M), Erg=50-M, M < 50;" + " Erg,E,T,S : measured(E,T,S,V), not guessed(E,T,S,V), toGuess(E,T,S), obs(E,T,S,M), Erg=M-49, M >= 50} " + str(max_weight) + " .")
         control.ground([("minWeight", [])])
 
-    def setup_card(self, control, minsize):
-        if self.do_mincard:
+        control.configuration.solve.opt_mode ="ignore"#"optN" #
+        control.configuration.solve.project = "project" # ????
+        control.configuration.solve.models = limit # ????
+        #print control.conf.solver[0].keys()
+
+
+        if do_mincard:
             if self.opts.force_size:
                 maxsize = self.opts.force_size
             else:
@@ -207,70 +264,107 @@ class ASPSolver:
             control.add("minSize", [], ":- not " + str(minsize) + " #sum {L,I,J : dnf(I,J) , hyper(I,J,L)} " + str(maxsize) + ".")
             control.ground([("minSize", [])])
 
-    @property
-    def do_mincard(self):
-        return  self.opts.family == "mincard" \
-            or self.opts.force_size is not None
-
-    def solutions(self, on_model, on_model_weight=None, limit=0,
-                    force_weight=None):
-
-        control = self.default_control("0")
-
-        do_subsets = self.opts.family == "subset" \
-            or (self.opts.family =="mincard" and self.opts.mincard_tolerance)
-        minsize = None
-
-        self.setup_opt(control)
-        control.ground([("base", [])])
-
-        control.load(aspf("show.lp"))
-        control.ground([("show", [])])
-
-        start = time.time()
-
-        if self.nodataset:
-            force_weight = 0
-
-        if force_weight is None:
-            control.assign_external(gringo.Fun("tolerance"),False)
-            dbg("# start initial solving")
-            opt = []
-            res = control.solve(None, lambda model: opt.append(model.optimization()))
-            dbg("# initial solve took %s" % (time.time()-start))
-
-            optimizations = opt.pop()
-            dbg("# optimizations = %s" % optimizations)
-
-            weight = optimizations[0]
-            if self.do_mincard:
-                minsize = optimizations[1]
-            if weight > 0 and on_model_weight is not None:
-                dbg("# model has weight, changing enumeration mode")
-                for sample in self.solution_samples():
-                    on_model_weight(sample)
-                return
-
-            control.assign_external(gringo.Fun("tolerance"),True)
-        else:
-            weight = force_weight
-            dbg("# force weight = %d" % weight)
-
-        self.setup_weight(control, weight)
-        self.setup_card(control, minsize)
-
-        control.conf.solve.opt_mode = "ignore"
-        control.conf.solve.project = 1 # ????
-        control.conf.solve.models = limit # ????
-        #print control.conf.solver[0].keys()
         if do_subsets:
-            control.conf.solve.enum_mode = "domRec"
-            control.conf.solver[0].heuristic = "Domain"
-            control.conf.solver[0].dom_mod = "5,16"
+        # ----------------------------- Misbah ------------------------------------------
+            #control.configuration.solve.enum_mode = "domRec"
+            control.configuration.solver[0].heuristic = "Domain"
+            #control.configuration.solver[0].dom_mod = "5,16
+            
+            class Context:
+                def __init__(self):
+                    self.dnf_args = []
+                    self.ndnf_args = []
+                def dnf(self):
+                    return self.dnf_args
+                def ndnf(self):
+                    return self.ndnf_args
 
-        start = time.time()
-        dbg("# begin enumeration")
-        res = control.solve(None, on_model)
-        dbg("# enumeration took %s" % (time.time()-start))
+            ctx = Context()
 
+            start = time.time()
+            dbg("# begin enumeration")
 
+            control.load(aspf("diversity.lp"))
+            models = 0
+            while True:
+                atoms, natoms = [], []
+                with control.solve(yield_=True) as solutions:
+                    for model in solutions:
+                        atoms = model.symbols(atoms=True)
+                        natoms = model.symbols(atoms=True, complement=True)
+                        on_model(model)
+                        #print ("Model: True Atoms", atoms, "Model: False Atoms", natoms)
+                        break
+                    else:
+                        break
+
+                ctx.dnf_args = []
+                for atom in atoms:
+                    n, a = atom.name, atom.arguments
+                    if n == "dnf" and len(a) == 2:
+                        #print (atom)
+                        control.assign_external(clingo.Function("before",a),True)
+                        ctx.dnf_args.append(tuple(a))
+                for atom in natoms:
+                    n, a = atom.name, atom.arguments
+                    if n == "dnf" and len(a) == 2:
+                        control.assign_external(clingo.Function("before",a),False)
+
+                control.ground([("skip", [])], ctx)
+                models += 1
+            dbg("# enumeration took %s" % (time.time()-start))
+        # ----------------------------- Misbah ------------------------------------------
+
+        '''#Flavio-Xor	
+        if self.opts.xor is not None:
+            file = open("xorfile.txt","w")
+            parities = []
+            constraints = [] 
+
+            clause = [atom.symbol for atom in control.symbolic_atoms.by_signature("clause",3)]
+            dnf = [atom.symbol for atom in control.symbolic_atoms.by_signature("dnf",2)]
+            literals = clause + dnf
+            for element in literals:
+                file.write("%s\n"%(element))
+            
+            # Read grounded atoms and randomly add xor constraints
+            if self.opts.xor > 0:
+                estimateds = self.opts.xor
+            else:
+                estimateds = int(log(len(literals),2))
+            file.write("adding %s xor constraints\n"%(estimateds))
+
+            for i in range(estimateds):
+                size = random.randint(1, (len(literals) + 1) / 2)
+                terms = random.sample(literals, size)
+                parity = random.randint(0,1)
+                print("constraint: %s, parity: %s, terms: %s"%(i+1, parity, terms))
+                constraints.append(terms)
+                
+                parities.append(parity)
+
+            for index in range(len(constraints)):
+                terms = " ; ".join(str(x) for x in constraints[index])
+                aspconstr = ":- X = { %s }, X\\2==%s."%(terms, parities[index])
+                file.write("%s\n"%(aspconstr))
+                #control.add("q", ["t"], aspconstr)
+                #control.ground([("q", [terms])])
+            file.close()'''
+
+        if self.opts.xor is not None:
+            control.register_propagator(Propagator(self.opts.xor))
+        
+        if not do_subsets:
+            start = time.time()
+            dbg("# begin enumeration")
+        
+            res = control.solve(on_model=on_model)
+            pprint(control.statistics)
+            #res = control.solve_async(None, on_model, on_finish)
+            #res.wait()
+            dbg("# enumeration took %s" % (time.time()-start))
+            #print(on_model)
+
+#Misbah --- Solving at Execution time ---
+
+#Misbah --- Solving at Execution time ---
