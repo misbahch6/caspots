@@ -19,8 +19,6 @@ class funset(set):
     def push(self, *objs):
         for obj in objs:
             self.update(obj.to_funset())
-        return self
-
     def to_funset(self):
         return self
 

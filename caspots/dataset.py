@@ -4,16 +4,20 @@ import sys
 import pandas as pd
 import numpy as np
 
-import gringo
+#import gringo
+import clingo 
+#from caspo.core.setup import Setup
+#from caspo.core.literal import Literal
+#from caspo.core.clamping import Clamping, ClampingList
 
-from caspo.core.setup import Setup
-from caspo.core.literal import Literal
-from caspo.core.clamping import Clamping, ClampingList
+from .setup import Setup
+from .literal import Literal
+from .clamping import Clamping, ClampingList
 
 from .asputils import *
 from .utils import *
 
-
+from crossvar import globalvariables
 class Experiment:
     def __init__(self, id):
         self.id = id
@@ -54,11 +58,6 @@ class Dataset:
         self.name = name
         self.dfactor = dfactor
         self.discretize = getattr(self, "discretize_%s" % discretize)
-        self.setup = Setup([], [], [])
-        self.stimulus = set()
-        self.inhibitors = set()
-        self.readout = set()
-        self.experiments = {}
 
     def discretize_round(self, value):
         return int(round(self.dfactor*value))
@@ -135,6 +134,7 @@ class Dataset:
                     continue
                 var = var[3:]
                 time = int(row.get("DA:%s" % var))
+		#time = int(row.get("DA_%s" % var))
                 dvalue = self.discretize(fvalue)
                 bvalue = self.binarize(dvalue)
                 exp.add_obs(time, var, bvalue, dvalue)
@@ -158,10 +158,10 @@ class Dataset:
             clampings.append(Clamping(literals))
             for time, obs in exp.dobs.items():
                 for var, dval in obs.items():
-                    fs.add(gringo.Fun('obs', [i, time, var, dval]))
+                    fs.add(clingo.Function('obs', [i, time, var, dval]))
         clampings = ClampingList(clampings)
         fs.update(clampings.to_funset("exp"))
-        fs.add(gringo.Fun('dfactor', [self.dfactor]))
+        fs.add(clingo.Function('dfactor', [self.dfactor]))
         return fs
 
     def __str__(self):
