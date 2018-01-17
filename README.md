@@ -1,4 +1,4 @@
-# Caspots - Boolean network inference from time series data with perturbations
+# Caspots V2 - Boolean network inference from time series data with perturbations
 
 ## Requirements
 
