@@ -7,7 +7,7 @@ RUN conda install -y pandas networkx joblib scikit-learn
 # install caspo for clingo 5
 WORKDIR /tmp
 RUN git clone -b clingo-5 --single-branch https://github.com/bioasp/caspo.git
-RUN pip install caspo
+RUN pip install ./caspo
 RUN rm -rf caspo
 # add user caspots
 RUN useradd -ms /bin/bash caspots
