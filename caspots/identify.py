@@ -39,7 +39,7 @@ def crunch_data(answer, predicate, factor):
         if p in ["obs", predicate]:
             args = a.arguments
             key = tuple(args[:3])
-            val = args[3]
+            val = args[3].number
             if p == "obs":
                 val /= factor
             t = "obs" if p == "obs" else "bin"
